@@ -1,5 +1,5 @@
 """Overhear - a listening assistant that shows its work."""
-import io, os
+import gc, io, json, os
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from torchvision.models.vgg import make_layers, cfgs
 import librosa
 import cv2
 import matplotlib
@@ -17,7 +18,6 @@ from scipy.spatial.distance import cdist
 from huggingface_hub import hf_hub_download
 
 HF_REPO = "Snehith450/overhear-weights"    # EDIT: your Hugging Face repo name
-CUTOFFS = {"mel": 0.80, "fused": 0.70}           # EDIT only if your validation tables say so
 
 SR = 22050
 CLIP = SR * 5
@@ -31,10 +31,25 @@ NAMES = {"dog": "Dog barking", "crying_baby": "Baby crying", "door_wood_knock": 
 LEVEL = {"siren": "HIGH", "glass_breaking": "HIGH", "crackling_fire": "HIGH", "crying_baby": "HIGH",
          "car_horn": "MEDIUM", "door_wood_knock": "MEDIUM", "clock_alarm": "MEDIUM", "dog": "MEDIUM",
          "thunderstorm": "LOW", "door_wood_creaks": "LOW"}
+ARCHS = ["resnet18", "vgg16", "cnngru", "sresnet"]
+KEYS = ["ensemble"] + ARCHS
+LABELS = {"ensemble": "Ensemble (all four models)", "resnet18": "ResNet-18", "vgg16": "VGG-16",
+          "cnngru": "CNN-GRU", "sresnet": "SResNet (simplified)"}
 
 BG, INK, MUTED, LINE, AMBER = "#12100E", "#EAE3D2", "#8C8576", "#2B2823", "#E8A33D"
 CMAP = LinearSegmentedColormap.from_list("overhear", [BG, "#3A2712", "#9A5F14", AMBER, "#F7EACB"])
 plt.rcParams["font.family"] = "monospace"
+
+
+def load_config():
+    try:
+        with open(os.path.join(HERE, "overhear_config.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {"default": "resnet18", "cutoffs": {}, "clean_test": {}, "ensemble_clean": None}
+
+
+CFG = load_config()
 
 st.set_page_config(page_title="Overhear", layout="wide", initial_sidebar_state="collapsed")
 
@@ -49,6 +64,7 @@ st.markdown("""
 .tag { margin:0.5rem 0 1.4rem; }
 .label { margin:1.3rem 0 0.6rem; border-top:1px solid #2B2823; padding-top:0.7rem; }
 .verdict { font-family:'Instrument Serif',serif; font-size:3.8rem; line-height:1.05; margin:0.2rem 0 0.5rem; }
+.verdict.likely { color:#CDBF9C; }
 .verdict.unsure { font-style:italic; color:#8C8576; }
 .meta { font-size:0.8rem; color:#8C8576; line-height:1.7; }
 .lvl-high { color:#E8A33D; }
@@ -71,7 +87,10 @@ div[data-baseweb="tab-highlight"] { background:#E8A33D; }
 """, unsafe_allow_html=True)
 
 
-# ---------- model ----------
+# ---------- the four architectures (same definitions as in training) ----------
+norm = lambda x: (x - 0.5) / 0.25
+
+
 def make_branch():
     m = torchvision.models.resnet18(weights=None)
     m.conv1 = nn.Conv2d(1, 64, 7, 2, 3, bias=False)
@@ -79,29 +98,107 @@ def make_branch():
     return m
 
 
-class Net(nn.Module):
-    def __init__(self, use_mel, use_rp, n_classes=10):
+def vgg_branch():
+    feats = make_layers(cfgs["D"], batch_norm=True)     # VGG-16 conv part only (saves memory)
+    feats[0] = nn.Conv2d(1, 64, 3, padding=1)
+    return nn.Sequential(feats, nn.AdaptiveAvgPool2d(1), nn.Flatten())
+
+
+class TwoStream(nn.Module):
+    def __init__(self, kind, n_classes=10):
         super().__init__()
-        self.use_mel, self.use_rp = use_mel, use_rp
-        self.mel_net = make_branch() if use_mel else None
-        self.rp_net = make_branch() if use_rp else None
-        dim = 512 * (int(use_mel) + int(use_rp))
-        self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(dim, n_classes))
+        mk = make_branch if kind == "resnet18" else vgg_branch
+        self.mel, self.rp = mk(), mk()
+        self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(1024, n_classes))
 
     def forward(self, mel, rp):
-        feats = []
-        if self.use_mel: feats.append(self.mel_net((mel - 0.5) / 0.25))
-        if self.use_rp: feats.append(self.rp_net((rp - 0.5) / 0.25))
-        return self.head(torch.cat(feats, dim=1))
+        return self.head(torch.cat([self.mel(norm(mel)), self.rp(norm(rp))], dim=1))
 
 
-@st.cache_resource(show_spinner="Loading model...")
-def load_model(key):
-    fname, use_rp = ("overhear_fused.pt", True) if key == "fused" else ("overhear_mel.pt", False)
-    path = hf_hub_download(HF_REPO, fname)
-    m = Net(True, use_rp)
+class CNNGRU(nn.Module):
+    def __init__(self, n_classes=10):
+        super().__init__()
+        self.mel, self.rp = vgg_branch(), vgg_branch()
+        self.gru = nn.GRU(128, 128, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
+        self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(512 + 512 + 256, n_classes))
+
+    def forward(self, mel, rp):
+        m, r = norm(mel), norm(rp)
+        g, _ = self.gru(m.squeeze(1).transpose(1, 2))
+        return self.head(torch.cat([self.mel(m), self.rp(r), g.mean(dim=1)], dim=1))
+
+
+class SwiGLUGate(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.norm = nn.BatchNorm2d(c)
+        self.expand = nn.Conv2d(c, 2 * c, 1)
+        self.project = nn.Conv2d(c, c, 1)
+
+    def forward(self, x):
+        a, b = self.expand(self.norm(x)).chunk(2, dim=1)
+        return x + self.project(a * F.silu(b))
+
+
+class CrossFusion(nn.Module):
+    def __init__(self, c, heads=4):
+        super().__init__()
+        self.mel_from_rp = nn.MultiheadAttention(c, heads, batch_first=True)
+        self.rp_from_mel = nn.MultiheadAttention(c, heads, batch_first=True)
+        self.n1, self.n2 = nn.LayerNorm(c), nn.LayerNorm(c)
+        self.g1, self.g2 = nn.Parameter(torch.zeros(1)), nn.Parameter(torch.zeros(1))
+
+    def forward(self, fm, fr):
+        B, C, Hm, Wm = fm.shape
+        _, _, Hr, Wr = fr.shape
+        tm, tq = fm.flatten(2).transpose(1, 2), fr.flatten(2).transpose(1, 2)
+        nm_, nr_ = self.n1(tm), self.n2(tq)
+        am, _ = self.mel_from_rp(nm_, nr_, nr_)
+        ar, _ = self.rp_from_mel(nr_, nm_, nm_)
+        fm = fm + self.g1 * am.transpose(1, 2).reshape(B, C, Hm, Wm)
+        fr = fr + self.g2 * ar.transpose(1, 2).reshape(B, C, Hr, Wr)
+        return fm, fr
+
+
+class SResNet(nn.Module):
+    def __init__(self, n_classes=10):
+        super().__init__()
+        self.mel, self.rp = make_branch(), make_branch()
+        chans = (64, 128, 256, 512)
+        self.gm = nn.ModuleList([SwiGLUGate(c) for c in chans])
+        self.gr = nn.ModuleList([SwiGLUGate(c) for c in chans])
+        self.fuse = CrossFusion(128)
+        self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(1024, n_classes))
+
+    def _stem(self, net, x):
+        return net.maxpool(net.relu(net.bn1(net.conv1(x))))
+
+    def forward(self, mel, rp):
+        a, b = self._stem(self.mel, norm(mel)), self._stem(self.rp, norm(rp))
+        a, b = self.gm[0](self.mel.layer1(a)), self.gr[0](self.rp.layer1(b))
+        a, b = self.gm[1](self.mel.layer2(a)), self.gr[1](self.rp.layer2(b))
+        a, b = self.fuse(a, b)
+        a, b = self.gm[2](self.mel.layer3(a)), self.gr[2](self.rp.layer3(b))
+        a, b = self.gm[3](self.mel.layer4(a)), self.gr[3](self.rp.layer4(b))
+        return self.head(torch.cat([a.mean((2, 3)), b.mean((2, 3))], dim=1))
+
+
+def build(arch):
+    if arch in ("resnet18", "vgg16"):
+        return TwoStream(arch)
+    return CNNGRU() if arch == "cnngru" else SResNet()
+
+
+def build_loaded(arch):
+    path = hf_hub_download(HF_REPO, f"overhear_{arch}.pt")
+    m = build(arch)
     m.load_state_dict(torch.load(path, map_location="cpu"))
     return m.float().eval()
+
+
+@st.cache_resource(show_spinner="Loading model...", max_entries=1)   # keeps only one model in memory
+def load_cached(arch):
+    return build_loaded(arch)
 
 
 # ---------- the two pictures (same recipe as training) ----------
@@ -121,7 +218,7 @@ def make_rp(y):
 
 
 def prepare(wav):
-    """Model expects 5 seconds: take the loudest 5 s of long clips, pad short ones."""
+    """Models expect 5 seconds: take the loudest 5 s of long clips, pad short ones."""
     if len(wav) > CLIP:
         starts = range(0, len(wav) - CLIP + 1, SR // 2)
         best = max(starts, key=lambda s: np.sqrt(np.mean(wav[s:s + CLIP] ** 2)))
@@ -131,24 +228,21 @@ def prepare(wav):
     return wav.astype(np.float32)
 
 
-def analyse(model, wav):
-    mel, rp = make_mel(wav), make_rp(wav)
-    mel_t, rp_t = torch.tensor(mel)[None, None], torch.tensor(rp)[None, None]
-    with torch.no_grad():
-        probs = torch.softmax(model(mel_t, rp_t), dim=1)[0].numpy()
-    return mel, rp, mel_t, rp_t, probs
+def cam_layer(model, arch):
+    if arch in ("resnet18", "sresnet"):
+        return model.mel.layer4[-1]
+    return model.mel[0][-1]                              # vgg16 and cnngru
 
 
-def gradcam(model, mel_t, rp_t, class_idx):
-    """Where the Mel branch concentrated for the chosen class."""
+def gradcam(model, arch, mel_t, rp_t, class_idx):
+    """Where the Mel stream concentrated for the chosen class."""
     store = {}
-    layer = model.mel_net.layer4[-1]
 
     def fwd(module, inp, out):
         store["a"] = out
         out.register_hook(lambda g: store.__setitem__("g", g))
 
-    handle = layer.register_forward_hook(fwd)
+    handle = cam_layer(model, arch).register_forward_hook(fwd)
     with torch.enable_grad():
         model.zero_grad()
         out = model(mel_t, rp_t)
@@ -160,6 +254,33 @@ def gradcam(model, mel_t, rp_t, class_idx):
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
     return cam.detach().numpy()
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def analyse(wav, key):
+    mel, rp = make_mel(wav), make_rp(wav)
+    mel_t, rp_t = torch.tensor(mel)[None, None], torch.tensor(rp)[None, None]
+    if key == "ensemble":
+        plist, keep = [], None
+        for a in ARCHS:                                  # one model at a time, to stay inside memory
+            m = build_loaded(a)
+            with torch.no_grad():
+                plist.append(torch.softmax(m(mel_t, rp_t), dim=1)[0].numpy())
+            if a == "resnet18":
+                keep = m
+            else:
+                del m
+                gc.collect()
+        probs = np.mean(plist, axis=0)
+        cam = gradcam(keep, "resnet18", mel_t, rp_t, int(probs.argmax()))   # attention from ResNet-18 member
+        del keep
+        gc.collect()
+    else:
+        m = load_cached(key)
+        with torch.no_grad():
+            probs = torch.softmax(m(mel_t, rp_t), dim=1)[0].numpy()
+        cam = gradcam(m, key, mel_t, rp_t, int(probs.argmax()))
+    return mel, rp, probs, cam
 
 
 # ---------- drawing ----------
@@ -195,18 +316,19 @@ def fig_mel(mel, cam):
 
 def fig_rp(rp):
     fig, ax = panel("RECURRENCE FINGERPRINT")
-    ax.imshow(rp, origin="lower", aspect="equal", cmap=CMAP, extent=[0, 5, 0, 5])
+    ax.imshow(rp, origin="lower", aspect="auto", cmap=CMAP, extent=[0, 5, 0, 5])
     fig.tight_layout()
     return fig
 
 
 def fig_noise(tbl):
-    fig, ax = plt.subplots(figsize=(7.2, 3), dpi=200)
+    fig, ax = plt.subplots(figsize=(7.2, 3.2), dpi=200)
     fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
-    style = {"A: Mel only": (INK, "-"), "B: RP only": (MUTED, "--"), "C: Mel + RP (fused)": (AMBER, "-")}
+    style = {"Ensemble": (AMBER, "-", 2.0), "ResNet-18": (INK, "-", 1.1), "VGG-16": ("#B9AE97", "--", 1.1),
+             "CNN-GRU": (MUTED, ":", 1.4), "SResNet": ("#C98A2B", "-.", 1.1)}
     for col in tbl.columns:
-        c, ls = style.get(col, (INK, "-"))
-        ax.plot(tbl.index, tbl[col], color=c, ls=ls, lw=1.4, marker="o", ms=3, label=col)
+        c, ls, lw = style.get(col, (INK, "-", 1.1))
+        ax.plot(tbl.index, tbl[col], color=c, ls=ls, lw=lw, marker="o", ms=2.5, label=col)
     ax.axhline(10, color=LINE, lw=0.8)
     ax.text(0, 12, "chance level", color=MUTED, fontsize=6)
     ax.set_ylim(0, 100)
@@ -216,27 +338,30 @@ def fig_noise(tbl):
     ax.tick_params(colors=MUTED, labelsize=6, length=0)
     ax.set_ylabel("test accuracy %", color=MUTED, fontsize=6)
     ax.set_xlabel("background noise: clean to loudest", color=MUTED, fontsize=6)
-    ax.legend(frameon=False, labelcolor=INK, fontsize=6)
+    ax.legend(frameon=False, labelcolor=INK, fontsize=6, ncol=3)
     fig.tight_layout()
     return fig
 
 
-def verdict_html(probs, cutoff):
+def verdict_html(probs, sure, likely):
     order = np.argsort(probs)[::-1]
-    i = int(order[0]); conf = probs[i]
-    if conf >= cutoff:
-        lvl = LEVEL[CLASSES[i]]
-        return ('<div class="label">VERDICT</div>'
-                f'<div class="verdict">{NAMES[CLASSES[i]]}</div>'
+    a, b = int(order[0]), int(order[1])
+    conf = probs[a]
+    name, lvl = NAMES[CLASSES[a]], LEVEL[CLASSES[a]]
+    head = '<div class="label">VERDICT</div>'
+    if conf >= sure:
+        return (head + f'<div class="verdict">{name}</div>'
                 f'<div class="meta">{conf*100:.0f}% confident &nbsp;&middot;&nbsp; '
                 f'alert level <b class="lvl-{lvl.lower()}">{lvl}</b></div>')
-    a, b = int(order[0]), int(order[1])
-    return ('<div class="label">VERDICT</div>'
-            '<div class="verdict unsure">Not sure.</div>'
-            f'<div class="meta">Closest: {NAMES[CLASSES[a]]} {probs[a]*100:.0f}% &middot; '
+    if conf >= likely:
+        return (head + f'<div class="verdict likely">Probably {name.lower()}.</div>'
+                f'<div class="meta">{conf*100:.0f}% confident, below the bar for a firm answer. '
+                f'Next closest: {NAMES[CLASSES[b]]} {probs[b]*100:.0f}%. '
+                f'alert level <b class="lvl-{lvl.lower()}">{lvl}</b></div>')
+    return (head + '<div class="verdict unsure">Not sure.</div>'
+            f'<div class="meta">Closest: {name} {probs[a]*100:.0f}% &middot; '
             f'{NAMES[CLASSES[b]]} {probs[b]*100:.0f}%. '
-            'Below the confidence cutoff, so Overhear will not guess. '
-            'Try a cleaner or louder recording.</div>')
+            'Too uncertain to guess. Try a cleaner or louder recording.</div>')
 
 
 def bars_html(probs, k=4):
@@ -259,7 +384,11 @@ with tab_listen:
     wav = None
     with left:
         st.markdown('<div class="label" style="border-top:none;margin-top:0">MODEL</div>', unsafe_allow_html=True)
-        mode = st.radio("Model", ["Mel (default)", "Fusion (Mel + recurrence plot)"], label_visibility="collapsed")
+        default_key = CFG.get("default", "resnet18")
+        choice = st.radio("Model", KEYS, index=KEYS.index(default_key) if default_key in KEYS else 0,
+                          format_func=lambda k: LABELS[k], label_visibility="collapsed")
+        st.markdown('<div class="note">The ensemble averages all four models. It is the most careful option '
+                    'and the slowest, especially on the first run.</div>', unsafe_allow_html=True)
         st.markdown('<div class="label">SOURCE</div>', unsafe_allow_html=True)
         sources = ["Sample", "Upload", "Record"] if hasattr(st, "audio_input") else ["Sample", "Upload"]
         src = st.radio("Source", sources, horizontal=True, label_visibility="collapsed")
@@ -288,6 +417,7 @@ with tab_listen:
                     'padded if shorter. Prototype for demonstration, not a certified safety device.</div>',
                     unsafe_allow_html=True)
 
+    ready = False
     with right:
         if wav is None or len(wav) == 0:
             st.markdown('<div class="label" style="border-top:none;margin-top:0">VERDICT</div>'
@@ -297,53 +427,72 @@ with tab_listen:
                         '<div class="verdict unsure">Too quiet.</div>'
                         '<div class="meta">That recording is almost silent.</div>', unsafe_allow_html=True)
         else:
-            key = "fused" if mode.startswith("Fusion") else "mel"
-            model = load_model(key)
             wav = prepare(wav)
-            mel, rp, mel_t, rp_t, probs = analyse(model, wav)
-            cam = gradcam(model, mel_t, rp_t, int(probs.argmax()))
-            st.markdown(verdict_html(probs, CUTOFFS[key]) + bars_html(probs), unsafe_allow_html=True)
+            try:
+                with st.spinner("Listening..."):
+                    mel, rp, probs, cam = analyse(wav, choice)
+                sure, likely = CFG.get("cutoffs", {}).get(choice, [0.80, 0.60])
+                st.markdown(verdict_html(probs, sure, likely) + bars_html(probs), unsafe_allow_html=True)
+                ready = True
+            except Exception as e:
+                st.error(f"Could not run the model. Check HF_REPO and the weight files. Details: {e}")
 
-    if wav is not None and len(wav) > 0 and np.sqrt(np.mean(wav ** 2)) >= 1e-4:
+    if ready:
         st.markdown('<div class="label">EVIDENCE</div>', unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3, gap="medium")
         c1.pyplot(fig_wave(wav), clear_figure=True)
         c2.pyplot(fig_mel(mel, cam), clear_figure=True)
         c3.pyplot(fig_rp(rp), clear_figure=True)
-        st.markdown('<div class="note">Contours mark where the model concentrated for its top guess. '
-                    'They are coarse by design: the network\'s last layer is a 4 x 7 grid. '
-                    'In the fingerprint, dark means two moments sounded alike. It drives the verdict '
-                    'only in Fusion mode.</div>', unsafe_allow_html=True)
+        who = "the ResNet-18 member of the ensemble" if choice == "ensemble" else LABELS[choice]
+        st.markdown(f'<div class="note">Contours mark where {who} concentrated for the top guess. '
+                    'They are coarse by design. In the fingerprint, dark means two moments sounded alike. '
+                    'All four models read both pictures.</div>', unsafe_allow_html=True)
 
 with tab_lab:
-    st.markdown('<div class="serif2">Does a recurrence plot help?</div>'
-                '<div class="body">Zeng, Zhou and Cai (2026) propose fusing a Mel-spectrogram with a recurrence '
-                'plot (RP) for environmental sound classification. I tested that idea on 10 household alert '
-                'sounds from ESC-50, using its official folds so no clip appears in both training and test.</div>',
-                unsafe_allow_html=True)
-    st.markdown("""
-<table class="lab"><tr><th>MODEL</th><th>TEST ACCURACY, MEAN +/- SD OF 3 RUNS</th></tr>
-<tr><td>Mel only</td><td>96.7 +/- 0.6 %</td></tr>
-<tr><td>Recurrence plot only</td><td>77.5 +/- 3.7 %</td></tr>
-<tr><td>Mel + recurrence plot (fused)</td><td>95.0 +/- 1.0 %</td></tr></table>
-""", unsafe_allow_html=True)
+    st.markdown('<div class="serif2">Does a recurrence plot help, and does the architecture matter?</div>'
+                '<div class="body">Zeng, Zhou and Cai (2026) fuse a Mel-spectrogram (a linear time-frequency view) '
+                'with a recurrence plot (a non-linear view of how a sound repeats) for environmental sound '
+                'classification. I rebuilt four model families around those two views and tested them on 10 '
+                'household alert sounds from ESC-50, using its official folds so no clip appears in both '
+                'training and test. Training clips also received noisy copies, using noise clips that are never '
+                'used in evaluation.</div>', unsafe_allow_html=True)
+
+    rows = "".join(f"<tr><td>{k}</td><td>{v} %</td></tr>" for k, v in CFG.get("clean_test", {}).items())
+    if CFG.get("ensemble_clean") is not None:
+        rows += f"<tr><td>Ensemble (all four)</td><td>{CFG['ensemble_clean']:.1f} %</td></tr>"
+    st.markdown('<table class="lab"><tr><th>MODEL</th><th>CLEAN TEST ACCURACY, 80 CLIPS '
+                '(MEAN +/- SD OF 3 TRAINING RUNS)</th></tr>' + rows + '</table>', unsafe_allow_html=True)
+
     st.markdown('<div class="serif2">Under noise</div>'
-                '<div class="body">I mixed in background noise (rain, wind, engine, vacuum cleaner, washing '
-                'machine) at several levels and re-tested.</div>', unsafe_allow_html=True)
+                '<div class="body">Background noise (rain, wind, engine, vacuum cleaner, washing machine) '
+                'was mixed into the test clips at several levels.</div>', unsafe_allow_html=True)
     try:
-        st.pyplot(fig_noise(pd.read_csv(os.path.join(HERE, "noise_table.csv"), index_col=0)), clear_figure=True)
+        tbl = pd.read_csv(os.path.join(HERE, "noise_table.csv"), index_col=0)
+        st.pyplot(fig_noise(tbl), clear_figure=True)
+        noisy = tbl.drop(index="clean", errors="ignore")
+        means = noisy.mean()
+        spread = means.max() - means.min()
+        verdict = ("The spread is small, so I treat the systems as comparable."
+                   if spread < 3 else "The gap is larger than test-set noise, so it is probably real.")
+        st.markdown(f'<div class="body">Averaged over the noisy levels, {means.idxmax()} scored highest '
+                    f'({means.max():.1f}%) and {means.idxmin()} lowest ({means.min():.1f}%). '
+                    f'The spread is {spread:.1f} points. {verdict}</div>', unsafe_allow_html=True)
     except Exception:
         st.markdown('<div class="note">noise_table.csv not found.</div>', unsafe_allow_html=True)
-    st.markdown(f"""
-<div class="serif2">What I conclude</div>
-<div class="body">The recurrence plot carries real information on its own, but adding it gave no reliable gain,
-on clean audio or in noise. The small differences are within the noise of an 80-clip test. That is why Overhear
-defaults to the Mel model and offers Fusion as a switch you can try. Each model has its own "not sure" cutoff
-({CUTOFFS['mel']*100:.0f}% for Mel, {CUTOFFS['fused']*100:.0f}% for Fusion). On clean test audio every confident
-Mel answer was correct. In heavy noise (5 dB) confidence is less trustworthy: at a 70% cutoff the Mel model was
-wrong on about 1 in 4 of its answers.</div>
+
+    st.markdown("""
+<div class="serif2">How the models differ</div>
+<div class="body">
+<b>ResNet-18</b> and <b>VGG-16</b>: two pretrained streams, one per picture, features joined.<br>
+<b>CNN-GRU</b>: the VGG-16 streams plus a recurrent network that reads the sound as a sequence in time.<br>
+<b>SResNet (simplified)</b>: ResNet-18 streams with SwiGLU gated residual blocks and cross-attention between the
+two pictures. This is my own simplified reading of the paper's design, not the authors' code.<br>
+<b>Ensemble</b>: averages the four models' probabilities.<br><br>
+Confidence bars drive three outcomes: a firm answer, "probably", or "not sure". The two cutoffs for each system
+were chosen on a validation fold with and without noise, then checked on the test fold.
+</div>
 <div class="serif2">Limits I would fix next</div>
-<div class="body">Only 10 classes and 80 test clips (one clip is 1.25 points). The noise test used one trained
-model per type. My RP is built from sound-tone features, not the raw waveform as in the paper. Next: repeat with
-more seeds and all 50 classes, and test on real phone recordings.</div>
+<div class="body">Only 10 classes and 80 test clips (one clip is 1.25 points), so small differences between models
+are not meaningful. My recurrence plot is built from sound-tone features, not the raw waveform as in the paper.
+Next: repeat with more seeds and all 50 classes, and test on real phone recordings.</div>
 """, unsafe_allow_html=True)
