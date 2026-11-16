@@ -1,0 +1,33 @@
+{
+  "default": "cnngru",
+  "cutoffs": {
+    "ensemble": [
+      0.4,
+      0.4
+    ],
+    "resnet18": [
+      0.4,
+      0.4
+    ],
+    "vgg16": [
+      0.4,
+      0.4
+    ],
+    "cnngru": [
+      0.4,
+      0.4
+    ],
+    "sresnet": [
+      0.4,
+      0.4
+    ]
+  },
+  "clean_test": {
+    "ResNet-18": "95.4 \u00b1 1.2",
+    "VGG-16": "95.0 \u00b1 1.0",
+    "CNN-GRU": "94.6 \u00b1 0.6",
+    "SResNet": "95.0 \u00b1 1.0"
+  },
+  "ensemble_clean": 96.2,
+  "n_test": 80
+}
