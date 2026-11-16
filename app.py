@@ -1,4 +1,4 @@
-"""Overhear - a listening assistant that shows its work."""
+"""Overhear - a listening assistant that shows its work (57 classes: ESC-50 + UrbanSound8K)."""
 import gc, io, json, os
 import numpy as np
 import pandas as pd
@@ -17,24 +17,21 @@ from matplotlib.colors import LinearSegmentedColormap
 from scipy.spatial.distance import cdist
 from huggingface_hub import hf_hub_download
 
-HF_REPO = "Snehith450/overhear-weights"    # EDIT: your Hugging Face repo name
+HF_REPO = "Snehith450/overhear-weights"
 
 SR = 22050
 CLIP = SR * 5
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLASSES = ["dog", "crying_baby", "door_wood_knock", "door_wood_creaks", "clock_alarm",
-           "siren", "car_horn", "glass_breaking", "crackling_fire", "thunderstorm"]
-NAMES = {"dog": "Dog barking", "crying_baby": "Baby crying", "door_wood_knock": "Door knock",
-         "door_wood_creaks": "Door creaking", "clock_alarm": "Alarm clock", "siren": "Siren",
-         "car_horn": "Car horn", "glass_breaking": "Glass breaking",
-         "crackling_fire": "Crackling fire", "thunderstorm": "Thunderstorm"}
-LEVEL = {"siren": "HIGH", "glass_breaking": "HIGH", "crackling_fire": "HIGH", "crying_baby": "HIGH",
-         "car_horn": "MEDIUM", "door_wood_knock": "MEDIUM", "clock_alarm": "MEDIUM", "dog": "MEDIUM",
-         "thunderstorm": "LOW", "door_wood_creaks": "LOW"}
+
 ARCHS = ["resnet18", "vgg16", "cnngru", "sresnet"]
 KEYS = ["ensemble"] + ARCHS
-LABELS = {"ensemble": "Ensemble (all four models)", "resnet18": "ResNet-18", "vgg16": "VGG-16",
-          "cnngru": "CNN-GRU", "sresnet": "SResNet (simplified)"}
+LABELS = {
+    "ensemble": "Ensemble (all four models)",
+    "resnet18": "ResNet-18",
+    "vgg16": "VGG-16",
+    "cnngru": "CNN-GRU",
+    "sresnet": "SResNet (simplified)",
+}
 
 BG, INK, MUTED, LINE, AMBER = "#12100E", "#EAE3D2", "#8C8576", "#2B2823", "#E8A33D"
 CMAP = LinearSegmentedColormap.from_list("overhear", [BG, "#3A2712", "#9A5F14", AMBER, "#F7EACB"])
@@ -42,14 +39,15 @@ plt.rcParams["font.family"] = "monospace"
 
 
 def load_config():
-    try:
-        with open(os.path.join(HERE, "overhear_config.json")) as f:
-            return json.load(f)
-    except Exception:
-        return {"default": "resnet18", "cutoffs": {}, "clean_test": {}, "ensemble_clean": None}
+    with open(os.path.join(HERE, "overhear57_config.json")) as f:
+        return json.load(f)
 
 
 CFG = load_config()
+CLASSES = CFG["classes"]
+NAMES = CFG["names"]
+LEVEL = CFG["levels"]
+NCLS = len(CLASSES)
 
 st.set_page_config(page_title="Overhear", layout="wide", initial_sidebar_state="collapsed")
 
@@ -68,7 +66,8 @@ st.markdown("""
 .verdict.unsure { font-style:italic; color:#8C8576; }
 .meta { font-size:0.8rem; color:#8C8576; line-height:1.7; }
 .lvl-high { color:#E8A33D; }
-.row { display:grid; grid-template-columns:150px 1fr 44px; gap:12px; align-items:center; font-size:0.78rem; padding:5px 0; }
+.lvl-medium { color:#EAE3D2; }
+.row { display:grid; grid-template-columns:170px 1fr 44px; gap:12px; align-items:center; font-size:0.78rem; padding:5px 0; }
 .bar { height:2px; background:#2B2823; display:block; }
 .bar i { display:block; height:2px; background:#E8A33D; }
 .pc { text-align:right; color:#8C8576; }
@@ -99,13 +98,13 @@ def make_branch():
 
 
 def vgg_branch():
-    feats = make_layers(cfgs["D"], batch_norm=True)     # VGG-16 conv part only (saves memory)
+    feats = make_layers(cfgs["D"], batch_norm=True)
     feats[0] = nn.Conv2d(1, 64, 3, padding=1)
     return nn.Sequential(feats, nn.AdaptiveAvgPool2d(1), nn.Flatten())
 
 
 class TwoStream(nn.Module):
-    def __init__(self, kind, n_classes=10):
+    def __init__(self, kind, n_classes=NCLS):
         super().__init__()
         mk = make_branch if kind == "resnet18" else vgg_branch
         self.mel, self.rp = mk(), mk()
@@ -116,7 +115,7 @@ class TwoStream(nn.Module):
 
 
 class CNNGRU(nn.Module):
-    def __init__(self, n_classes=10):
+    def __init__(self, n_classes=NCLS):
         super().__init__()
         self.mel, self.rp = vgg_branch(), vgg_branch()
         self.gru = nn.GRU(128, 128, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
@@ -161,7 +160,7 @@ class CrossFusion(nn.Module):
 
 
 class SResNet(nn.Module):
-    def __init__(self, n_classes=10):
+    def __init__(self, n_classes=NCLS):
         super().__init__()
         self.mel, self.rp = make_branch(), make_branch()
         chans = (64, 128, 256, 512)
@@ -190,13 +189,13 @@ def build(arch):
 
 
 def build_loaded(arch):
-    path = hf_hub_download(HF_REPO, f"overhear_{arch}.pt")
+    path = hf_hub_download(HF_REPO, f"overhear57_{arch}.pt")
     m = build(arch)
     m.load_state_dict(torch.load(path, map_location="cpu"))
     return m.float().eval()
 
 
-@st.cache_resource(show_spinner="Loading model...", max_entries=1)   # keeps only one model in memory
+@st.cache_resource(show_spinner="Loading model...", max_entries=1)
 def load_cached(arch):
     return build_loaded(arch)
 
@@ -231,7 +230,7 @@ def prepare(wav):
 def cam_layer(model, arch):
     if arch in ("resnet18", "sresnet"):
         return model.mel.layer4[-1]
-    return model.mel[0][-1]                              # vgg16 and cnngru
+    return model.mel[0][-1]
 
 
 def gradcam(model, arch, mel_t, rp_t, class_idx):
@@ -262,7 +261,7 @@ def analyse(wav, key):
     mel_t, rp_t = torch.tensor(mel)[None, None], torch.tensor(rp)[None, None]
     if key == "ensemble":
         plist, keep = [], None
-        for a in ARCHS:                                  # one model at a time, to stay inside memory
+        for a in ARCHS:
             m = build_loaded(a)
             with torch.no_grad():
                 plist.append(torch.softmax(m(mel_t, rp_t), dim=1)[0].numpy())
@@ -272,7 +271,7 @@ def analyse(wav, key):
                 del m
                 gc.collect()
         probs = np.mean(plist, axis=0)
-        cam = gradcam(keep, "resnet18", mel_t, rp_t, int(probs.argmax()))   # attention from ResNet-18 member
+        cam = gradcam(keep, "resnet18", mel_t, rp_t, int(probs.argmax()))
         del keep
         gc.collect()
     else:
@@ -329,8 +328,9 @@ def fig_noise(tbl):
     for col in tbl.columns:
         c, ls, lw = style.get(col, (INK, "-", 1.1))
         ax.plot(tbl.index, tbl[col], color=c, ls=ls, lw=lw, marker="o", ms=2.5, label=col)
-    ax.axhline(10, color=LINE, lw=0.8)
-    ax.text(0, 12, "chance level", color=MUTED, fontsize=6)
+    chance = 100.0 / NCLS
+    ax.axhline(chance, color=LINE, lw=0.8)
+    ax.text(0, chance + 2, f"chance level ({chance:.1f}%)", color=MUTED, fontsize=6)
     ax.set_ylim(0, 100)
     ax.grid(axis="y", color=LINE, lw=0.5)
     for s in ax.spines.values():
@@ -364,7 +364,7 @@ def verdict_html(probs, sure, likely):
             'Too uncertain to guess. Try a cleaner or louder recording.</div>')
 
 
-def bars_html(probs, k=4):
+def bars_html(probs, k=5):
     rows = ""
     for i in np.argsort(probs)[::-1][:k]:
         p = probs[i] * 100
@@ -376,7 +376,8 @@ def bars_html(probs, k=4):
 
 # ---------- page ----------
 st.markdown('<div class="wordmark">Overhear</div>'
-            '<div class="tag">A listening assistant that shows its work</div>', unsafe_allow_html=True)
+            f'<div class="tag">A listening assistant that shows its work &middot; {NCLS} environmental sounds</div>',
+            unsafe_allow_html=True)
 tab_listen, tab_lab = st.tabs(["Listen", "Lab notes"])
 
 with tab_listen:
@@ -384,7 +385,7 @@ with tab_listen:
     wav = None
     with left:
         st.markdown('<div class="label" style="border-top:none;margin-top:0">MODEL</div>', unsafe_allow_html=True)
-        default_key = CFG.get("default", "resnet18")
+        default_key = CFG.get("default", "ensemble")
         choice = st.radio("Model", KEYS, index=KEYS.index(default_key) if default_key in KEYS else 0,
                           format_func=lambda k: LABELS[k], label_visibility="collapsed")
         st.markdown('<div class="note">The ensemble averages all four models. It is the most careful option '
@@ -394,7 +395,9 @@ with tab_listen:
         src = st.radio("Source", sources, horizontal=True, label_visibility="collapsed")
         try:
             if src == "Sample":
-                pick = st.selectbox("Sample", CLASSES, index=CLASSES.index("siren"),
+                sorted_classes = sorted(CLASSES, key=lambda c: NAMES[c])
+                default_idx = sorted_classes.index("siren") if "siren" in sorted_classes else 0
+                pick = st.selectbox("Sample", sorted_classes, index=default_idx,
                                     format_func=lambda c: NAMES[c], label_visibility="collapsed")
                 path = os.path.join(HERE, "samples", f"{pick}.wav")
                 wav, _ = librosa.load(path, sr=SR, mono=True)
@@ -431,7 +434,7 @@ with tab_listen:
             try:
                 with st.spinner("Listening..."):
                     mel, rp, probs, cam = analyse(wav, choice)
-                sure, likely = CFG.get("cutoffs", {}).get(choice, [0.80, 0.60])
+                sure, likely = CFG.get("cutoffs", {}).get(choice, [0.75, 0.30])
                 st.markdown(verdict_html(probs, sure, likely) + bars_html(probs), unsafe_allow_html=True)
                 ready = True
             except Exception as e:
@@ -452,22 +455,25 @@ with tab_lab:
     st.markdown('<div class="serif2">Does a recurrence plot help, and does the architecture matter?</div>'
                 '<div class="body">Zeng, Zhou and Cai (2026) fuse a Mel-spectrogram (a linear time-frequency view) '
                 'with a recurrence plot (a non-linear view of how a sound repeats) for environmental sound '
-                'classification. I rebuilt four model families around those two views and tested them on 10 '
-                'household alert sounds from ESC-50, using its official folds so no clip appears in both '
-                'training and test. Training clips also received noisy copies, using noise clips that are never '
-                'used in evaluation.</div>', unsafe_allow_html=True)
+                f'classification. I rebuilt four model families around those two views and trained them on {NCLS} '
+                'environmental and urban sound classes merged from ESC-50 and UrbanSound8K, using official dataset folds '
+                'so no clip appears in both training and test. Training clips also received noisy copies using '
+                'coloured noise and other-class distractors from the training split only.</div>', unsafe_allow_html=True)
 
-    rows = "".join(f"<tr><td>{k}</td><td>{v} %</td></tr>" for k, v in CFG.get("clean_test", {}).items())
-    if CFG.get("ensemble_clean") is not None:
-        rows += f"<tr><td>Ensemble (all four)</td><td>{CFG['ensemble_clean']:.1f} %</td></tr>"
-    st.markdown('<table class="lab"><tr><th>MODEL</th><th>CLEAN TEST ACCURACY, 80 CLIPS '
-                '(MEAN +/- SD OF 3 TRAINING RUNS)</th></tr>' + rows + '</table>', unsafe_allow_html=True)
+    metrics = CFG.get("metrics", {})
+    rows = ""
+    for sys_name, m in metrics.items():
+        rows += (f"<tr><td>{sys_name}</td><td>{m['accuracy']:.1f}%</td><td>{m['macro_acc']:.1f}%</td>"
+                 f"<td>{m['macro_f1']:.1f}%</td><td>{m['esc']:.1f}%</td><td>{m['us8k']:.1f}%</td></tr>")
+    st.markdown(f'<table class="lab"><tr><th>MODEL</th><th>OVERALL ({CFG.get("n_test", 1237)} CLIPS)</th>'
+                '<th>MACRO ACC</th><th>MACRO F1</th><th>ESC-50</th><th>URBANSOUND8K</th></tr>'
+                + rows + '</table>', unsafe_allow_html=True)
 
     st.markdown('<div class="serif2">Under noise</div>'
-                '<div class="body">Background noise (rain, wind, engine, vacuum cleaner, washing machine) '
-                'was mixed into the test clips at several levels.</div>', unsafe_allow_html=True)
+                '<div class="body">Coloured noise (white, pink, brown) and unseen test-fold distractor sounds '
+                'were mixed into the test clips at several signal-to-noise levels.</div>', unsafe_allow_html=True)
     try:
-        tbl = pd.read_csv(os.path.join(HERE, "noise_table.csv"), index_col=0)
+        tbl = pd.read_csv(os.path.join(HERE, "noise_table57.csv"), index_col=0)
         st.pyplot(fig_noise(tbl), clear_figure=True)
         noisy = tbl.drop(index="clean", errors="ignore")
         means = noisy.mean()
@@ -478,21 +484,22 @@ with tab_lab:
                     f'({means.max():.1f}%) and {means.idxmin()} lowest ({means.min():.1f}%). '
                     f'The spread is {spread:.1f} points. {verdict}</div>', unsafe_allow_html=True)
     except Exception:
-        st.markdown('<div class="note">noise_table.csv not found.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="note">noise_table57.csv not found.</div>', unsafe_allow_html=True)
 
-    st.markdown("""
+    st.markdown(f"""
 <div class="serif2">How the models differ</div>
 <div class="body">
 <b>ResNet-18</b> and <b>VGG-16</b>: two pretrained streams, one per picture, features joined.<br>
-<b>CNN-GRU</b>: the VGG-16 streams plus a recurrent network that reads the sound as a sequence in time.<br>
+<b>CNN-GRU</b>: the VGG-16 streams plus a bidirectional GRU that reads the sound as a sequence in time.<br>
 <b>SResNet (simplified)</b>: ResNet-18 streams with SwiGLU gated residual blocks and cross-attention between the
 two pictures. This is my own simplified reading of the paper's design, not the authors' code.<br>
 <b>Ensemble</b>: averages the four models' probabilities.<br><br>
 Confidence bars drive three outcomes: a firm answer, "probably", or "not sure". The two cutoffs for each system
-were chosen on a validation fold with and without noise, then checked on the test fold.
+were chosen on the validation folds with and without noise, then checked on the test folds.
 </div>
 <div class="serif2">Limits I would fix next</div>
-<div class="body">Only 10 classes and 80 test clips (one clip is 1.25 points), so small differences between models
-are not meaningful. My recurrence plot is built from sound-tone features, not the raw waveform as in the paper.
-Next: repeat with more seeds and all 50 classes, and test on real phone recordings.</div>
+<div class="body">Class counts vary between ESC-50 and UrbanSound8K, so class-balanced sampling was used during training.
+My recurrence plot is built from MFCC sound-tone trajectories rather than the raw waveform as in the paper.
+Open-set rejection for sounds outside these {NCLS} classes relies on confidence thresholds rather than explicit
+unknown-class training, and real phone-microphone recordings have not yet been benchmarked at scale.</div>
 """, unsafe_allow_html=True)
